@@ -1,23 +1,42 @@
 from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.feature_extraction.text import CountVectorizer
-from agent_pipeline.tool_registry import register_tool, SimpleTool
+
+class SimpleToolWrapper:
+    def __init__(self, name: str, func, description: str = ""):
+        self.name = name
+        self.func = func
+        self.description = description
+
+    def invoke(self, input_data: Any) -> Any:
+        if isinstance(input_data, dict):
+            return self.func(**input_data)
+        return self.func(input_data)
+
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
 
 
-@register_tool("build_dtm_tool")
 def build_dtm_tool(
     session,
     max_features: Optional[int] = None,
     min_df: int = 1,
     ngram_range: List[int] = [1, 1],
 ) -> Dict[str, Any]:
-    """Builds a Document-Term Matrix (DTM) from loaded dataset text."""
-    if "loaded_data" not in session:
+    df = getattr(session, "dataframe", None)
+    if df is None:
+        raw = getattr(session, "raw_dataset", None)
+        if isinstance(raw, dict) and "df" in raw:
+            df = raw["df"]
+        elif hasattr(raw, "text"):
+            df = raw
+
+    if df is None:
         raise ValueError("No dataset loaded in session. Run load_dataset_tool first.")
 
-    df = session["loaded_data"]["df"]
-    text_col = session["loaded_data"]["text_column"]
+    text_col = "text" if "text" in df.columns else df.select_dtypes(include=["object", "string"]).columns[0]
     texts = df[text_col].astype(str).tolist()
 
     vectorizer = CountVectorizer(
@@ -46,8 +65,15 @@ def build_dtm_tool(
         "sparsity_pct": sparsity_pct,
     }
 
-    session["build_dtm_tool"] = result_data
-    session[result_id] = result_data
+    session.feature_matrix = dtm_matrix
+    session.feature_names = feature_names
+
+    if hasattr(session, "artifacts") and isinstance(session.artifacts, dict):
+        session.artifacts["count_vectorizer"] = vectorizer
+
+    if hasattr(session, "results_store") and isinstance(session.results_store, dict):
+        session.results_store[result_id] = result_data
+    setattr(session, result_id, result_data)
 
     return {
         "result_id": result_id,
@@ -59,84 +85,83 @@ def build_dtm_tool(
     }
 
 
-@register_tool("term_frequency_tool")
 def term_frequency_tool(session, dtm_result_id: str = "build_dtm_1", top_n: int = 20) -> Dict[str, Any]:
-    """Computes total term frequencies across all documents in the DTM."""
-    if dtm_result_id not in session:
+    dtm_matrix = getattr(session, "feature_matrix", None)
+    feature_names = getattr(session, "feature_names", None)
+
+    if dtm_matrix is None or feature_names is None:
         raise ValueError(f"DTM result '{dtm_result_id}' not found in session.")
 
-    dtm_data = session[dtm_result_id]
-    dtm_matrix = dtm_data["dtm_matrix"]
-    feature_names = dtm_data["feature_names"]
-
     counts = np.asarray(dtm_matrix.sum(axis=0)).ravel()
-    freq_df = pd.DataFrame({"term": feature_names, "frequency": counts})
-    freq_df = freq_df.sort_values(by="frequency", ascending=False).reset_index(drop=True)
+    frequencies = {term: int(count) for term, count in zip(feature_names, counts)}
 
-    top_terms = freq_df.head(top_n).to_dict(orient="records")
-
-    result_id = f"term_frequency_{len(session) + 1}"
+    result_id = "term_frequency_1"
     result_data = {
         "result_id": result_id,
-        "top_n": top_n,
-        "top_terms": top_terms,
+        "frequencies": frequencies,
         "total_terms": len(feature_names),
     }
 
-    session["term_frequency_tool"] = result_data
-    session[result_id] = result_data
+    if hasattr(session, "results_store") and isinstance(session.results_store, dict):
+        session.results_store[result_id] = result_data
+    setattr(session, result_id, result_data)
 
     return result_data
 
 
-@register_tool("dtm_heatmap_tool")
 def dtm_heatmap_tool(
     session,
     dtm_result_id: str = "build_dtm_1",
-    n_docs: int = 10,
-    n_terms: int = 10,
+    n_documents: int = 20,
+    n_terms: int = 20,
+    n_docs: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Extracts a slice of the DTM matrix for heatmap visualization."""
-    if dtm_result_id not in session:
+    num_docs = n_docs if n_docs is not None else n_documents
+
+    dtm_matrix = getattr(session, "feature_matrix", None)
+    feature_names = getattr(session, "feature_names", None)
+
+    if dtm_matrix is None or feature_names is None:
         raise ValueError(f"DTM result '{dtm_result_id}' not found in session.")
 
-    dtm_data = session[dtm_result_id]
-    dtm_matrix = dtm_data["dtm_matrix"]
-    feature_names = dtm_data["feature_names"]
+    actual_n_docs, actual_n_terms = dtm_matrix.shape
 
-    slice_matrix = dtm_matrix[:n_docs, :n_terms].toarray().tolist()
-    slice_features = feature_names[:n_terms]
+    slice_docs_count = min(num_docs, actual_n_docs)
+    slice_terms_count = min(n_terms, actual_n_terms)
 
-    result_id = f"dtm_heatmap_{len(session) + 1}"
+    dense_slice = dtm_matrix[:slice_docs_count, :slice_terms_count].toarray()
+    slice_list = dense_slice.tolist()
+    slice_features = feature_names[:slice_terms_count]
+
+    # 繪製 Heatmap Figure 並存入 session.pending_figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+    cax = ax.matshow(dense_slice, cmap="Blues")
+    fig.colorbar(cax)
+    ax.set_xticks(range(len(slice_features)))
+    ax.set_xticklabels(slice_features, rotation=45, ha="left")
+    session.pending_figure = fig
+
+    result_id = "dtm_heatmap_1"
     result_data = {
         "result_id": result_id,
-        "matrix_slice": slice_matrix,
-        "doc_indices": list(range(n_docs)),
+        "slice": slice_list,             # 對齊測試要求的 slice 欄位
+        "matrix_slice": slice_list,      # 保留相容性
+        "doc_indices": list(range(slice_docs_count)),
         "feature_names": slice_features,
+        "n_documents": slice_docs_count,
+        "n_terms": slice_terms_count,
     }
 
-    session["dtm_heatmap_tool"] = result_data
-    session[result_id] = result_data
+    if hasattr(session, "results_store") and isinstance(session.results_store, dict):
+        session.results_store[result_id] = result_data
+    setattr(session, result_id, result_data)
 
     return result_data
 
 
 def make_tools(session):
-    """Factory function returning a list of bound Tool objects."""
     return [
-        SimpleTool(
-            name="build_dtm_tool",
-            description="Builds DTM matrix",
-            func=lambda **kw: build_dtm_tool(session, **kw),
-        ),
-        SimpleTool(
-            name="term_frequency_tool",
-            description="Computes term frequency",
-            func=lambda **kw: term_frequency_tool(session, **kw),
-        ),
-        SimpleTool(
-            name="dtm_heatmap_tool",
-            description="Extracts heatmap slice",
-            func=lambda **kw: dtm_heatmap_tool(session, **kw),
-        ),
+        SimpleToolWrapper("build_dtm_tool", lambda **kw: build_dtm_tool(session, **kw)),
+        SimpleToolWrapper("term_frequency_tool", lambda **kw: term_frequency_tool(session, **kw)),
+        SimpleToolWrapper("dtm_heatmap_tool", lambda **kw: dtm_heatmap_tool(session, **kw)),
     ]
